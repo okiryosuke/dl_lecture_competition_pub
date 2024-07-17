@@ -11,6 +11,12 @@ import torch.nn as nn
 import torchvision
 from torchvision import transforms
 
+from tqdm import tqdm
+import os
+from transformers import BertTokenizer, BertModel
+from torch.cuda.amp import autocast
+
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -57,6 +63,7 @@ def process_text(text):
 
     # 連続するスペースを1つに変換
     text = re.sub(r'\s+', ' ', text).strip()
+    
 
     return text
 
@@ -131,13 +138,42 @@ class VQADataset(torch.utils.data.Dataset):
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
+        question_words = process_text(self.df["question"][idx]).split(" ")
+
+        """
+        # BERTによる分散表現
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        bertmodel = BertModel.from_pretrained('bert-base-uncased')
+
+        device = "cuda"
+        bertmodel.to(device)
+
+        question_words = self.df["question"][idx]
+        encoded_dict = tokenizer.encode_plus(
+                    question_words,
+                    add_special_tokens=True,
+                    max_length=16,
+                    padding='max_length',
+                    truncation=True,
+                    return_attention_mask=True,
+                    return_tensors='pt',
+               )
+
+        input_ids = encoded_dict['input_ids'].to(device)
+        attention_masks = encoded_dict['attention_mask'].to(device)
+
+        with torch.no_grad():
+            with autocast():
+                outputs = bertmodel(input_ids, attention_mask=attention_masks)
+
+        last_hidden_state = outputs.last_hidden_state.cpu()
+        """
         for word in question_words:
             try:
                 question[self.question2idx[word]] = 1  # one-hot表現に変換
             except KeyError:
                 question[-1] = 1  # 未知語
-
+                
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
@@ -292,7 +328,12 @@ class VQAModel(nn.Module):
         super().__init__()
         self.resnet = ResNet18()
         self.text_encoder = nn.Linear(vocab_size, 512)
-
+        """
+        self.text_encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(12288, 512)
+        )
+        """
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
@@ -302,6 +343,7 @@ class VQAModel(nn.Module):
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
         question_feature = self.text_encoder(question)  # テキストの特徴量
+        # print(image_feature.shape, question_feature.shape)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -318,20 +360,23 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+    with tqdm(total=len(dataloader),unit="batch") as pbar:
+        for image, question, answers, mode_answer in dataloader:
+            image, question, answer, mode_answer = \
+                image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+            pred = model(image, question)
+            loss = criterion(pred, mode_answer.squeeze())
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+            total_loss += loss.item()
+            total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
+            simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+            pbar.update(1)
+
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -362,9 +407,14 @@ def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
+    print(torch.__version__)
+    print(torch.cuda.is_available())
 
     # dataloader / model
     transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
@@ -372,8 +422,8 @@ def main():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=6)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=6)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
@@ -383,7 +433,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
-    for epoch in range(num_epoch):
+    for epoch in tqdm(range(num_epoch)):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
